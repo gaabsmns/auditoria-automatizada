@@ -177,16 +177,41 @@ def encontrar_linha_cabecalho(df_sem_cabecalho):
     return None
 
 
+def extrair_municipio_origem(df_sem_cabecalho):
+    for _, linha in df_sem_cabecalho.head(6).iterrows():
+        for valor in linha.dropna().tolist():
+            texto = str(valor).strip()
+
+            if not texto:
+                continue
+
+            texto_limpo = texto_normalizado(texto)
+
+            if (
+                "RELATORIO" in texto_limpo or
+                "PERIODO" in texto_limpo or
+                "CISMETRO" in texto_limpo
+            ):
+                continue
+
+            return texto
+
+    return "municipio"
+
+
 def aplicar_cabecalho_detectado(df_sem_cabecalho):
+    municipio = extrair_municipio_origem(df_sem_cabecalho)
     linha_cabecalho = encontrar_linha_cabecalho(df_sem_cabecalho)
 
     if linha_cabecalho is None:
+        df_sem_cabecalho.attrs["municipio_origem"] = municipio
         return df_sem_cabecalho
 
     colunas = df_sem_cabecalho.iloc[linha_cabecalho].tolist()
     df = df_sem_cabecalho.iloc[linha_cabecalho + 1:].copy()
     df.columns = colunas
     df = df.dropna(how="all")
+    df.attrs["municipio_origem"] = municipio
 
     return df
 
@@ -1007,6 +1032,20 @@ def gerar_excel(resultados):
 
     return arquivo
 
+
+def limpar_nome_arquivo(texto):
+    texto = str(texto).strip()
+    texto = re.sub(r'[\\/:*?"<>|]+', "-", texto)
+    texto = re.sub(r"\s+", " ", texto)
+    return texto.strip(" .-") or "municipio"
+
+
+def nome_base_relatorio(df):
+    municipio = limpar_nome_arquivo(
+        df.attrs.get("municipio_origem", "municipio")
+    )
+    return f"auditoria_apontamentos - {municipio}"
+
 # ==================================================
 # EXECUCAO AUDITORIA
 # ==================================================
@@ -1059,11 +1098,12 @@ if STREAMLIT_AVAILABLE:
 
             relatorio = gerar_word(resultados)
             relatorio_excel = gerar_excel(resultados)
+            nome_relatorio = nome_base_relatorio(df)
 
             st.download_button(
                 label="Baixar Excel com apontamentos",
                 data=relatorio_excel,
-                file_name="auditoria_apontamentos.xlsx",
+                file_name=f"{nome_relatorio}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
@@ -1071,14 +1111,14 @@ if STREAMLIT_AVAILABLE:
                 st.download_button(
                     label="Baixar Word",
                     data=relatorio,
-                    file_name="auditoria.docx",
+                    file_name=f"{nome_relatorio}.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 )
             else:
                 st.download_button(
                     label="Baixar TXT",
                     data=relatorio,
-                    file_name="auditoria.txt",
+                    file_name=f"{nome_relatorio}.txt",
                     mime="text/plain"
                 )
 
@@ -1133,8 +1173,9 @@ def executar_terminal(caminho_entrada, caminho_saida=None):
     imprimir_resumo(resultados)
 
     if caminho_saida is None:
+        nome_relatorio = nome_base_relatorio(df)
         caminho_saida = arquivo_entrada.with_name(
-            f"{arquivo_entrada.stem}_apontamentos.txt"
+            f"{nome_relatorio}.txt"
         )
 
     caminho_saida = Path(caminho_saida)
