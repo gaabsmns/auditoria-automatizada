@@ -49,7 +49,32 @@ if STREAMLIT_AVAILABLE:
     )
 
 
-def obter_senha_app():
+def obter_usuarios_app():
+    usuarios = {}
+
+    usuarios_env = os.getenv("AUDITORIA_USUARIOS")
+
+    if usuarios_env:
+        for item in usuarios_env.split(";"):
+            if ":" not in item:
+                continue
+
+            usuario, senha = item.split(":", 1)
+            usuarios[usuario.strip().lower()] = senha.strip()
+
+    if STREAMLIT_AVAILABLE:
+        try:
+            usuarios_secrets = st.secrets.get("USUARIOS", {})
+
+            for usuario, senha in usuarios_secrets.items():
+                usuarios[str(usuario).strip().lower()] = str(senha)
+        except Exception:
+            pass
+
+    return usuarios
+
+
+def obter_senha_geral_app():
     senha = os.getenv("AUDITORIA_SENHA")
 
     if senha:
@@ -65,28 +90,45 @@ def obter_senha_app():
 
 
 def verificar_acesso_streamlit():
-    senha_configurada = obter_senha_app()
+    usuarios_configurados = obter_usuarios_app()
+    senha_geral = obter_senha_geral_app()
 
-    if not senha_configurada:
+    if not usuarios_configurados and not senha_geral:
         st.warning(
-            "Senha nao configurada. Para publicar com seguranca, configure AUDITORIA_SENHA."
+            "Login nao configurado. Para publicar com seguranca, configure USUARIOS ou AUDITORIA_SENHA."
         )
         return True
 
     if st.session_state.get("acesso_liberado"):
         return True
 
+    usuario_digitado = st.text_input(
+        "Usuario/E-mail"
+    ).strip().lower()
+
     senha_digitada = st.text_input(
-        "Senha de acesso",
+        "Senha",
         type="password"
     )
 
     if st.button("Entrar"):
-        if senha_digitada == senha_configurada:
+        usuario_valido = (
+            usuario_digitado in usuarios_configurados and
+            senha_digitada == usuarios_configurados[usuario_digitado]
+        )
+
+        senha_geral_valida = (
+            senha_geral and
+            senha_digitada == senha_geral and
+            not usuarios_configurados
+        )
+
+        if usuario_valido or senha_geral_valida:
             st.session_state["acesso_liberado"] = True
+            st.session_state["usuario_logado"] = usuario_digitado
             st.rerun()
         else:
-            st.error("Senha incorreta")
+            st.error("Usuario ou senha incorretos")
 
     return False
 
