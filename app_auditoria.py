@@ -12,6 +12,8 @@ from io import BytesIO
 from pathlib import Path
 import argparse
 import os
+import re
+import unicodedata
 import pandas as pd
 
 # ==================================================
@@ -91,13 +93,89 @@ def verificar_acesso_streamlit():
 # ==================================================
 # LEITURA DO ARQUIVO
 # ==================================================
+def texto_normalizado(valor):
+    texto = "" if pd.isna(valor) else str(valor).strip()
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    return texto.upper()
+
+
+def normalizar_nome_coluna(coluna):
+    nome = texto_normalizado(coluna)
+    nome = re.sub(r"\s+", " ", nome)
+
+    aliases = {
+        "DATA": "DATA",
+        "HORA": "HORA",
+        "PACIENTE": "PACIENTE",
+        "PROCEDIMENTO": "Procedimento",
+        "PROFISSIONAL": "Profissional",
+        "PROFISSIONA": "Profissional",
+        "FORNECEDOR": "Fornecedor",
+        "QUANTIDADE": "Quantidade",
+        "QTD": "Quantidade",
+        "UNIDADE BASICA": "Unidade Basica",
+        "UBS": "Unidade Basica",
+        "UNDIADE BASICA": "Unidade Basica",
+        "LOCAL DE ATENDIMENTO": "Local de Atendimento",
+    }
+
+    return aliases.get(nome, str(coluna).strip())
+
+
+def encontrar_linha_cabecalho(df_sem_cabecalho):
+    melhores_colunas = {"PROCEDIMENTO", "PROFISSIONAL", "PROFISSIONA", "FORNECEDOR"}
+
+    for indice, linha in df_sem_cabecalho.iterrows():
+        valores = {texto_normalizado(valor) for valor in linha.dropna().tolist()}
+
+        if len(valores & melhores_colunas) >= 3:
+            return indice
+
+    return None
+
+
+def aplicar_cabecalho_detectado(df_sem_cabecalho):
+    linha_cabecalho = encontrar_linha_cabecalho(df_sem_cabecalho)
+
+    if linha_cabecalho is None:
+        return df_sem_cabecalho
+
+    colunas = df_sem_cabecalho.iloc[linha_cabecalho].tolist()
+    df = df_sem_cabecalho.iloc[linha_cabecalho + 1:].copy()
+    df.columns = colunas
+    df = df.dropna(how="all")
+
+    return df
+
+
+def extrair_horas_procedimento(procedimento):
+    texto = texto_normalizado(procedimento)
+    match = re.search(r"(\d{1,2})\s*(HORA|HORAS|HRS|HR)\b", texto)
+
+    if match:
+        return float(match.group(1))
+
+    return pd.NA
+
+
+def eh_sessao(procedimento):
+    return texto_normalizado(procedimento).startswith("SESSAO")
+
+
+def eh_plantao(procedimento):
+    return "PLANTAO" in texto_normalizado(procedimento)
+
+
 def carregar_arquivo(file):
     nome = getattr(file, "name", str(file)).lower()
 
     if nome.endswith(".csv"):
-        return pd.read_csv(file)
+        df = pd.read_csv(file, header=None)
+        return aplicar_cabecalho_detectado(df)
 
-    return pd.read_excel(file)
+    df = pd.read_excel(file, header=None)
+    return aplicar_cabecalho_detectado(df)
 
 # ==================================================
 # NORMALIZACAO
@@ -105,12 +183,9 @@ def carregar_arquivo(file):
 def normalizar_dados(df):
     df = df.copy()
 
-    df.columns = [str(c).strip() for c in df.columns]
+    df.columns = [normalizar_nome_coluna(c) for c in df.columns]
 
     obrigatorias = [
-        "DATA",
-        "HORA",
-        "PACIENTE",
         "Procedimento",
         "Profissional",
         "Fornecedor"
@@ -126,26 +201,27 @@ def normalizar_dados(df):
             f"Colunas obrigatorias ausentes: {', '.join(faltando)}"
         )
 
-    df["DATA"] = pd.to_datetime(
-        df["DATA"],
-        errors="coerce"
-    )
+    if "DATA" in df.columns:
+        df["DATA"] = pd.to_datetime(
+            df["DATA"],
+            errors="coerce"
+        )
 
-    if df["DATA"].isna().all():
-        raise ValueError("Nenhuma data valida encontrada")
-
-    df["HORA"] = (
-        df["HORA"]
-        .astype(str)
-        .str.strip()
-    )
+    if "HORA" in df.columns:
+        df["HORA"] = (
+            df["HORA"]
+            .astype(str)
+            .str.strip()
+        )
 
     texto_cols = [
-        "PACIENTE",
         "Procedimento",
         "Profissional",
         "Fornecedor"
     ]
+
+    if "PACIENTE" in df.columns:
+        texto_cols.append("PACIENTE")
 
     for col in texto_cols:
         df[col] = (
@@ -155,37 +231,67 @@ def normalizar_dados(df):
             .str.strip()
         )
 
-    data_texto = df["DATA"].dt.strftime("%Y-%m-%d")
+    if "DATA" in df.columns and "HORA" in df.columns:
+        data_texto = df["DATA"].dt.strftime("%Y-%m-%d")
 
-    df["DATAHORA"] = pd.to_datetime(
-        data_texto + " " + df["HORA"],
-        errors="coerce"
-    )
+        df["DATAHORA"] = pd.to_datetime(
+            data_texto + " " + df["HORA"],
+            errors="coerce"
+        )
+    else:
+        df["DATAHORA"] = pd.NaT
 
     if "DuracaoHoras" in df.columns:
         df["DuracaoHoras"] = pd.to_numeric(
             df["DuracaoHoras"],
             errors="coerce"
         )
+        df["__DuracaoHorasOrigem"] = "coluna"
+    else:
+        df["DuracaoHoras"] = df["Procedimento"].apply(extrair_horas_procedimento)
+        df["__DuracaoHorasOrigem"] = "procedimento"
 
     if "Quantidade" in df.columns:
         df["Quantidade"] = pd.to_numeric(
             df["Quantidade"],
             errors="coerce"
         ).fillna(0)
+    else:
+        df["Quantidade"] = 1
 
-    return df.dropna(subset=["DATAHORA"])
+    if "DATA" in df.columns and "HORA" in df.columns:
+        return df.dropna(subset=["DATAHORA"])
+
+    return df
 
 
 def dataframe_vazio(df_base):
     return pd.DataFrame(columns=df_base.columns)
 
+
+def tem_colunas(df, colunas):
+    return all(coluna in df.columns for coluna in colunas)
+
+
+def tem_sobreposicao_real(inicio_atual, fim_atual, inicio_anterior, fim_anterior):
+    return inicio_anterior < fim_atual and inicio_atual < fim_anterior
+
 # ==================================================
 # REGRA 1
 # ==================================================
 def regra_1(df):
+    if not tem_colunas(df, ["Fornecedor", "Profissional", "DATA", "HORA", "PACIENTE"]):
+        return dataframe_vazio(df)
+
+    base = df[
+        ~df["Procedimento"].apply(eh_sessao)
+    ].copy()
+
+    if base.empty:
+        return dataframe_vazio(df)
+
     resultado = (
-        df.groupby([
+        base.groupby([
             "Fornecedor",
             "Profissional",
             "DATA",
@@ -205,10 +311,12 @@ def regra_1(df):
 # REGRA 2
 # ==================================================
 def regra_2(df):
+    if not tem_colunas(df, ["Profissional", "PACIENTE", "DATAHORA"]):
+        return dataframe_vazio(df)
+
     sessao = df[
         df["Procedimento"]
-        .str.upper()
-        .str.startswith("SESSAO", na=False)
+        .apply(eh_sessao)
     ].copy()
 
     if sessao.empty:
@@ -243,13 +351,12 @@ def regra_2(df):
 # REGRA 3
 # ==================================================
 def regra_3(df):
-    if "DuracaoHoras" not in df.columns:
+    if not tem_colunas(df, ["Profissional", "Procedimento", "DATAHORA", "DuracaoHoras"]):
         return dataframe_vazio(df)
 
     plantoes = df[
         df["Procedimento"]
-        .str.upper()
-        .str.contains("PLANTAO", na=False)
+        .apply(eh_plantao)
     ].copy()
 
     if plantoes.empty:
@@ -276,7 +383,12 @@ def regra_3(df):
             atual = grupo.iloc[i]
             proximo = grupo.iloc[i + 1]
 
-            if proximo["INICIO"] < atual["FIM"]:
+            if tem_sobreposicao_real(
+                proximo["INICIO"],
+                proximo["FIM"],
+                atual["INICIO"],
+                atual["FIM"]
+            ):
                 conflitos.extend([atual, proximo])
 
     if conflitos:
@@ -288,10 +400,12 @@ def regra_3(df):
 # REGRA 4
 # ==================================================
 def regra_4(df):
+    if not tem_colunas(df, ["PACIENTE", "Profissional", "DATAHORA"]):
+        return dataframe_vazio(df)
+
     sessao = df[
         df["Procedimento"]
-        .str.upper()
-        .str.startswith("SESSAO", na=False)
+        .apply(eh_sessao)
     ].copy()
 
     if sessao.empty:
@@ -325,21 +439,53 @@ def regra_4(df):
 # REGRA 5
 # ==================================================
 def regra_5(df):
-    resultado = (
-        df.groupby([
-            "Fornecedor",
-            "Profissional",
-            "PACIENTE",
-            "Procedimento",
-            "DATA"
-        ])
-        .filter(lambda x: len(x) > 1)
-        .sort_values([
-            "Profissional",
-            "PACIENTE",
-            "DATA"
-        ])
+    if not tem_colunas(df, ["Fornecedor", "Profissional", "PACIENTE", "Procedimento", "DATA"]):
+        return dataframe_vazio(df)
+
+    base = df.copy()
+    base = base[
+        ~base["Procedimento"].apply(eh_sessao)
+    ].copy()
+
+    if base.empty:
+        return dataframe_vazio(df)
+
+    base = base[
+        base["PACIENTE"].astype(str).str.strip().ne("") &
+        base["Procedimento"].astype(str).str.strip().ne("")
+    ].copy()
+
+    if base.empty:
+        return dataframe_vazio(df)
+
+    base["__FORNECEDOR_DUP"] = base["Fornecedor"].apply(texto_normalizado)
+    base["__PROFISSIONAL_DUP"] = base["Profissional"].apply(texto_normalizado)
+    base["__PACIENTE_DUP"] = base["PACIENTE"].apply(texto_normalizado)
+    base["__PROCEDIMENTO_DUP"] = base["Procedimento"].apply(texto_normalizado)
+    base["__DATA_DUP"] = base["DATA"].dt.strftime("%Y-%m-%d")
+
+    chaves = [
+        "__FORNECEDOR_DUP",
+        "__PROFISSIONAL_DUP",
+        "__PACIENTE_DUP",
+        "__PROCEDIMENTO_DUP",
+        "__DATA_DUP"
+    ]
+
+    base["QtdDuplicidade"] = (
+        base
+        .groupby(chaves, dropna=False)["PACIENTE"]
+        .transform("size")
     )
+
+    resultado = base[
+        base["QtdDuplicidade"] > 1
+    ].sort_values([
+        "PACIENTE",
+        "Procedimento",
+        "DATA",
+        "HORA"
+    ])
 
     return resultado.reset_index(drop=True)
 
@@ -347,19 +493,16 @@ def regra_5(df):
 # REGRA 6
 # ==================================================
 def regra_6(df):
-    if "DuracaoHoras" not in df.columns:
+    if not tem_colunas(df, ["Profissional", "Procedimento", "DATAHORA", "DuracaoHoras"]):
         return dataframe_vazio(df)
 
     plantoes = df[
         df["Procedimento"]
-        .str.upper()
-        .str.contains("PLANTAO", na=False)
+        .apply(eh_plantao)
     ].copy()
 
     outros = df[
-        ~df["Procedimento"]
-        .str.upper()
-        .str.contains("PLANTAO", na=False)
+        ~df["Procedimento"].apply(eh_plantao)
     ].copy()
 
     if plantoes.empty:
@@ -383,7 +526,7 @@ def regra_6(df):
         conflito = outros[
             (outros["Profissional"] == plantao["Profissional"]) &
             (outros["DATAHORA"] >= plantao["INICIO"]) &
-            (outros["DATAHORA"] <= plantao["FIM"])
+            (outros["DATAHORA"] < plantao["FIM"])
         ]
 
         if not conflito.empty:
@@ -401,11 +544,21 @@ def regra_7(df):
     if "DuracaoHoras" not in df.columns:
         return dataframe_vazio(df)
 
+    if (
+        "__DuracaoHorasOrigem" in df.columns and
+        not (df["__DuracaoHorasOrigem"] == "coluna").any()
+    ):
+        return dataframe_vazio(df)
+
     plantoes = df[
         df["Procedimento"]
-        .str.upper()
-        .str.contains("PLANTAO", na=False)
+        .apply(eh_plantao)
     ].copy()
+
+    if "__DuracaoHorasOrigem" in plantoes.columns:
+        plantoes = plantoes[
+            plantoes["__DuracaoHorasOrigem"] == "coluna"
+        ].copy()
 
     if plantoes.empty:
         return dataframe_vazio(df)
@@ -429,6 +582,170 @@ def regra_7(df):
         return pd.DataFrame(conflitos).reset_index(drop=True)
 
     return dataframe_vazio(df)
+
+
+# ==================================================
+# REGRA 8
+# ==================================================
+def eh_plantao_enfermagem(procedimento):
+    texto = texto_normalizado(procedimento)
+
+    if "PLANTAO" not in texto:
+        return False
+
+    return (
+        "PLANTAO ENFERMEIRO" in texto or
+        "PLANTAO TECNICO DE ENFERMAGEM" in texto
+    )
+
+
+def categoria_enfermagem(procedimento):
+    texto = texto_normalizado(procedimento)
+
+    if "TECNICO DE ENFERMAGEM" in texto:
+        return "Tecnico de enfermagem"
+
+    if "ENFERMEIRO" in texto:
+        return "Enfermeiro"
+
+    return ""
+
+
+def eh_plantao_raio_x(procedimento):
+    texto = texto_normalizado(procedimento)
+    return "PLANTAO DE TECNICO DE RAIO X" in texto
+
+
+def inicio_semana_domingo(data):
+    data = pd.to_datetime(data).normalize()
+    dias_desde_domingo = (data.weekday() + 1) % 7
+    return data - pd.Timedelta(days=dias_desde_domingo)
+
+
+def regra_8(df):
+    if not tem_colunas(df, ["Fornecedor", "Profissional", "Procedimento", "DuracaoHoras", "Quantidade"]):
+        return dataframe_vazio(df)
+
+    apontamentos = []
+    base = df.copy()
+    base["HorasCalculadas"] = base["DuracaoHoras"] * base["Quantidade"]
+
+    enfermagem = base[
+        base["Procedimento"].apply(eh_plantao_enfermagem) &
+        base["HorasCalculadas"].notna()
+    ].copy()
+
+    if not enfermagem.empty:
+        enfermagem["Categoria"] = enfermagem["Procedimento"].apply(categoria_enfermagem)
+
+        if "DATA" in enfermagem.columns and enfermagem["DATA"].notna().any():
+            enfermagem["MesReferencia"] = enfermagem["DATA"].dt.to_period("M").astype(str)
+            grupos_mensais = [
+                "Fornecedor",
+                "Profissional",
+                "Categoria",
+                "MesReferencia"
+            ]
+        else:
+            enfermagem["MesReferencia"] = "Periodo da planilha"
+            grupos_mensais = [
+                "Fornecedor",
+                "Profissional",
+                "Categoria",
+                "MesReferencia"
+            ]
+
+        total_mensal = (
+            enfermagem
+            .groupby(grupos_mensais, dropna=False)["HorasCalculadas"]
+            .sum()
+            .reset_index()
+        )
+
+        total_mensal = total_mensal[total_mensal["HorasCalculadas"] > 180]
+
+        for _, row in total_mensal.iterrows():
+            apontamentos.append({
+                "TipoApontamento": "Enfermagem acima de 180h mensais",
+                "Fornecedor": row["Fornecedor"],
+                "Profissional": row["Profissional"],
+                "Categoria": row["Categoria"],
+                "MesReferencia": row["MesReferencia"],
+                "TotalHoras": row["HorasCalculadas"],
+                "LimiteHoras": 180,
+                "ExcessoHoras": row["HorasCalculadas"] - 180,
+            })
+
+    raio_x = base[
+        base["Procedimento"].apply(eh_plantao_raio_x) &
+        base["HorasCalculadas"].notna()
+    ].copy()
+
+    if (
+        not raio_x.empty and
+        "DATA" in raio_x.columns and
+        raio_x["DATA"].notna().any()
+    ):
+        diario = (
+            raio_x
+            .groupby(["Fornecedor", "Profissional", "DATA"], dropna=False)["HorasCalculadas"]
+            .sum()
+            .reset_index()
+        )
+
+        diario = diario[diario["HorasCalculadas"] > 6]
+
+        for _, row in diario.iterrows():
+            apontamentos.append({
+                "TipoApontamento": "Raio X acima de 6h no dia",
+                "Fornecedor": row["Fornecedor"],
+                "Profissional": row["Profissional"],
+                "DATA": row["DATA"],
+                "TotalHoras": row["HorasCalculadas"],
+                "LimiteHoras": 6,
+                "ExcessoHoras": row["HorasCalculadas"] - 6,
+            })
+
+        raio_x["SemanaInicio"] = raio_x["DATA"].apply(inicio_semana_domingo)
+        raio_x["SemanaFim"] = raio_x["SemanaInicio"] + pd.Timedelta(days=6)
+
+        semanal = (
+            raio_x
+            .groupby(["Fornecedor", "Profissional", "SemanaInicio", "SemanaFim"], dropna=False)["HorasCalculadas"]
+            .sum()
+            .reset_index()
+        )
+
+        semanal = semanal[semanal["HorasCalculadas"] > 24]
+
+        for _, row in semanal.iterrows():
+            apontamentos.append({
+                "TipoApontamento": "Raio X acima de 24h semanais",
+                "Fornecedor": row["Fornecedor"],
+                "Profissional": row["Profissional"],
+                "SemanaInicio": row["SemanaInicio"],
+                "SemanaFim": row["SemanaFim"],
+                "TotalHoras": row["HorasCalculadas"],
+                "LimiteHoras": 24,
+                "ExcessoHoras": row["HorasCalculadas"] - 24,
+            })
+
+    if apontamentos:
+        return pd.DataFrame(apontamentos).reset_index(drop=True)
+
+    return pd.DataFrame(columns=[
+        "TipoApontamento",
+        "Fornecedor",
+        "Profissional",
+        "Categoria",
+        "MesReferencia",
+        "DATA",
+        "SemanaInicio",
+        "SemanaFim",
+        "TotalHoras",
+        "LimiteHoras",
+        "ExcessoHoras",
+    ])
 
 # ==================================================
 # GERACAO RELATORIO
@@ -509,26 +826,73 @@ def gerar_word(resultados):
 # ==================================================
 # FORMATACAO DE SAIDA
 # ==================================================
-def preparar_saida_apontamentos(df):
+def preparar_saida_apontamentos(df, nome_regra=None):
     df_saida = df.copy()
 
     colunas_internas = [
         "DATAHORA"
     ]
 
+    regras_com_colunas_resumidas = [
+        "Regra 1",
+        "Regra 3",
+        "Regra 4",
+        "Regra 5",
+        "Regra 6",
+        "Regra 7",
+    ]
+
+    colunas_para_remover = [
+        "Cód.Procedimento",
+        "Cod.Procedimento",
+        "Vlr.Unit.R$",
+        "Vlr.Total R$",
+        "Unidade Basica",
+        "Local de Atendimento",
+        "DuracaoHoras",
+    ]
+
+    if nome_regra and any(nome_regra.startswith(regra) for regra in regras_com_colunas_resumidas):
+        df_saida = df_saida.drop(
+            columns=[c for c in colunas_para_remover if c in df_saida.columns],
+            errors="ignore"
+        )
+
     df_saida = df_saida.drop(
-        columns=[c for c in colunas_internas if c in df_saida.columns],
+        columns=[
+            c for c in df_saida.columns
+            if c in colunas_internas or c.startswith("__")
+        ],
         errors="ignore"
     )
 
     for coluna in df_saida.columns:
         if pd.api.types.is_datetime64_any_dtype(df_saida[coluna]):
-            if coluna == "DATA":
+            if coluna in ["DATA", "Dt. Nasc."] or coluna.startswith("Semana"):
                 df_saida[coluna] = df_saida[coluna].dt.strftime("%d/%m/%Y")
             else:
                 df_saida[coluna] = df_saida[coluna].dt.strftime(
                     "%d/%m/%Y %H:%M:%S"
                 )
+
+    if "Dt. Nasc." in df_saida.columns:
+        data_nasc = pd.to_datetime(
+            df_saida["Dt. Nasc."],
+            errors="coerce",
+            dayfirst=True
+        )
+        df_saida["Dt. Nasc."] = data_nasc.dt.strftime("%d/%m/%Y").fillna(
+            df_saida["Dt. Nasc."].astype(str)
+        )
+
+    if "MesReferencia" in df_saida.columns:
+        mes = pd.to_datetime(
+            df_saida["MesReferencia"].astype(str) + "-01",
+            errors="coerce"
+        )
+        df_saida["MesReferencia"] = mes.dt.strftime("%m/%Y").fillna(
+            df_saida["MesReferencia"].astype(str)
+        )
 
     return df_saida
 
@@ -575,7 +939,7 @@ def gerar_excel(resultados):
                     index=False
                 )
             else:
-                df_saida = preparar_saida_apontamentos(df_regra)
+                df_saida = preparar_saida_apontamentos(df_regra, nome_regra)
 
                 df_saida.to_excel(
                     writer,
@@ -612,7 +976,8 @@ def executar_auditoria(df):
         "Regra 4 - Sessao profissionais diferentes": regra_4(df),
         "Regra 5 - Duplicidade": regra_5(df),
         "Regra 6 - Plantonista ocupado": regra_6(df),
-        "Regra 7 - Validade plantao": regra_7(df)
+        "Regra 7 - Validade plantao": regra_7(df),
+        "Regra 8 - Limite de horas": regra_8(df)
     }
 
 # ==================================================
@@ -638,7 +1003,7 @@ if STREAMLIT_AVAILABLE:
 
             st.success("Arquivo processado")
 
-            cols = st.columns(7)
+            cols = st.columns(len(resultados))
 
             for i, (nome, resultado) in enumerate(resultados.items()):
                 cols[i].metric(f"R{i+1}", len(resultado))
@@ -648,7 +1013,7 @@ if STREAMLIT_AVAILABLE:
                     if resultado.empty:
                         st.info("Nenhuma ocorrencia")
                     else:
-                        st.dataframe(preparar_saida_apontamentos(resultado))
+                        st.dataframe(preparar_saida_apontamentos(resultado, nome))
 
             relatorio = gerar_word(resultados)
             relatorio_excel = gerar_excel(resultados)
@@ -768,8 +1133,11 @@ def main():
 
     if args.testes:
         _teste_regra_1()
+        _teste_regra_1_ignora_sessao()
         _teste_regra_2()
         _teste_regra_5()
+        _teste_regra_5_ignora_sessao()
+        _teste_regra_6_plantao_sequencial_nao_conflita()
         _teste_sem_conflito()
         print("Testes internos executados com sucesso.")
         return
@@ -804,6 +1172,23 @@ def _teste_regra_1():
     assert len(resultado) == 2
 
 
+def _teste_regra_1_ignora_sessao():
+    dados = pd.DataFrame({
+        "Fornecedor": ["X", "X"],
+        "Profissional": ["ANA", "ANA"],
+        "DATA": ["2025-01-01", "2025-01-01"],
+        "HORA": ["08:00", "08:00"],
+        "PACIENTE": ["JOAO", "MARIA"],
+        "Procedimento": ["SESSÃO FISIO", "SESSÃO FISIO"]
+    })
+
+    dados = normalizar_dados(dados)
+
+    resultado = regra_1(dados)
+
+    assert resultado.empty
+
+
 def _teste_regra_2():
     dados = pd.DataFrame({
         "Fornecedor": ["X", "X"],
@@ -836,6 +1221,45 @@ def _teste_regra_5():
     resultado = regra_5(dados)
 
     assert len(resultado) == 2
+
+
+def _teste_regra_5_ignora_sessao():
+    dados = pd.DataFrame({
+        "Fornecedor": ["X", "X"],
+        "Profissional": ["ANA", "ANA"],
+        "DATA": ["2025-01-01", "2025-01-01"],
+        "HORA": ["08:00", "09:00"],
+        "PACIENTE": ["JOAO", "JOAO"],
+        "Procedimento": ["SESSÃO FISIO", "SESSÃO FISIO"]
+    })
+
+    dados = normalizar_dados(dados)
+
+    resultado = regra_5(dados)
+
+    assert resultado.empty
+
+
+def _teste_regra_6_plantao_sequencial_nao_conflita():
+    dados = pd.DataFrame({
+        "Fornecedor": ["X", "X"],
+        "Profissional": ["WESLEY", "WESLEY"],
+        "DATA": ["2026-04-10", "2026-04-10"],
+        "HORA": ["07:00", "11:00"],
+        "PACIENTE": ["KIRIA", "IVONE"],
+        "Procedimento": [
+            "PLANTÃO ENFERMEIRO - 04 Hrs",
+            "PLANTÃO ENFERMEIRO - 06 HRS"
+        ]
+    })
+
+    dados = normalizar_dados(dados)
+
+    resultado_regra_3 = regra_3(dados)
+    resultado_regra_6 = regra_6(dados)
+
+    assert resultado_regra_3.empty
+    assert resultado_regra_6.empty
 
 
 def _teste_sem_conflito():
