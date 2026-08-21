@@ -30,6 +30,7 @@ except ModuleNotFoundError:
 # ==================================================
 try:
     from docx import Document
+    from docx.shared import Pt
     DOCX_AVAILABLE = True
 except ModuleNotFoundError:
     DOCX_AVAILABLE = False
@@ -851,6 +852,103 @@ def gerar_relatorio_texto(resultados):
 # ==================================================
 # GERACAO WORD
 # ==================================================
+FRASES_APONTAMENTOS = {
+    "Regra 1": (
+        "Nao pode haver dois pacientes diferentes em um mesmo horario, porem "
+        "pode haver duplicidade de horario para um mesmo paciente quando realizou "
+        "mais de um procedimento. Necessario verificar os lancamentos abaixo:"
+    ),
+    "Regra 2": (
+        "Reforcamos que nas sessoes pode haver mais de um paciente por horario, "
+        "mas quando um mesmo paciente tem mais de uma sessao por dia, e necessario "
+        "lanca-las em horarios diferentes, com intervalo minimo de 30 minutos entre elas."
+    ),
+    "Regra 3": (
+        "Duplicidade de horario. E necessario finalizar a carga horaria de um plantao "
+        "antes de dar inicio a outro. Necessaria alteracao:"
+    ),
+    "Regra 4": (
+        "Para pacientes com duas sessoes no mesmo dia, se faz necessario o lancamento "
+        "dessas sessoes em horarios diferentes, com intervalo minimo de 30 minutos."
+    ),
+    "Regra 5": (
+        "Verificar se nao houve duplicidade de lancamento nos registros abaixo. "
+        "Caso tenha ocorrido duplicidade, e necessario excluir um dos lancamentos:"
+    ),
+    "Regra 6": (
+        "Durante carga horaria de plantao nao devem ser lancados outros procedimentos, "
+        "sendo necessario o termino da carga horaria do plantao para realizar qualquer "
+        "outro lancamento. Necessario verificar:"
+    ),
+    "Regra 7": (
+        "Necessario incluir o nome de pelo menos 4 pacientes atendidos no plantao "
+        "ou justificar o lancamento com quantidade menor:"
+    ),
+    "Regra 8": (
+        "Enviar justificativa para o cumprimento de horas excedentes no periodo pelos "
+        "profissionais listados abaixo, considerando os limites de carga horaria definidos:"
+    ),
+}
+
+
+def frase_apontamento(nome_regra):
+    for prefixo, frase in FRASES_APONTAMENTOS.items():
+        if nome_regra.startswith(prefixo):
+            return frase
+
+    return "Verificar os lancamentos relacionados abaixo:"
+
+
+def colunas_word_para_regra(df, nome_regra):
+    df_saida = preparar_saida_apontamentos(df, nome_regra)
+
+    preferencias = [
+        "DATA",
+        "HORA",
+        "PACIENTE",
+        "Dt. Nasc.",
+        "Procedimento",
+        "Quantidade",
+        "Profissional",
+        "Fornecedor",
+        "Categoria",
+        "MesReferencia",
+        "SemanaInicio",
+        "SemanaFim",
+        "TotalHoras",
+        "LimiteHoras",
+        "ExcessoHoras",
+        "QtdDuplicidade",
+    ]
+
+    colunas = [coluna for coluna in preferencias if coluna in df_saida.columns]
+
+    if not colunas:
+        colunas = list(df_saida.columns[:8])
+
+    return df_saida[colunas]
+
+
+def adicionar_tabela_word(doc, df_tabela):
+    if df_tabela.empty:
+        return
+
+    tabela = doc.add_table(rows=1, cols=len(df_tabela.columns))
+    tabela.style = "Table Grid"
+
+    cabecalho = tabela.rows[0].cells
+
+    for indice, coluna in enumerate(df_tabela.columns):
+        cabecalho[indice].text = str(coluna)
+
+    for _, row in df_tabela.iterrows():
+        celulas = tabela.add_row().cells
+
+        for indice, coluna in enumerate(df_tabela.columns):
+            valor = row.get(coluna, "")
+            celulas[indice].text = "" if pd.isna(valor) else str(valor)
+
+
 def gerar_word(resultados):
 
     if not DOCX_AVAILABLE:
@@ -858,30 +956,80 @@ def gerar_word(resultados):
 
     doc = Document()
 
+    estilo_normal = doc.styles["Normal"]
+    estilo_normal.font.name = "Arial"
+    estilo_normal.font.size = Pt(10)
+
     doc.add_heading(
-        "APONTAMENTOS DE AUDITORIA",
+        "APONTAMENTOS",
         level=1
     )
 
-    for nome_regra, df_regra in resultados.items():
-        doc.add_heading(nome_regra, level=2)
+    regras_com_resultado = {
+        nome_regra: df_regra
+        for nome_regra, df_regra in resultados.items()
+        if not df_regra.empty
+    }
 
-        if df_regra.empty:
-            doc.add_paragraph(
-                "Nenhuma ocorrencia encontrada"
-            )
-            continue
+    if not regras_com_resultado:
+        doc.add_paragraph("Nenhuma ocorrencia encontrada.")
+    else:
+        fornecedores = sorted({
+            str(row.get("Fornecedor", "Sem fornecedor")).strip() or "Sem fornecedor"
+            for df_regra in regras_com_resultado.values()
+            for _, row in df_regra.iterrows()
+        })
 
-        for _, row in df_regra.iterrows():
-            texto = (
-                f"{row.get('DATA', '')} | "
-                f"{row.get('HORA', '')} | "
-                f"Profissional: {row.get('Profissional', '')} | "
-                f"Paciente: {row.get('PACIENTE', '')} | "
-                f"Procedimento: {row.get('Procedimento', '')}"
-            )
+        for numero_fornecedor, fornecedor in enumerate(fornecedores, start=1):
+            doc.add_heading(f"{numero_fornecedor}. {fornecedor}", level=2)
 
-            doc.add_paragraph(texto)
+            profissionais_fornecedor = set()
+
+            for df_regra in regras_com_resultado.values():
+                df_fornecedor = df_regra[
+                    df_regra["Fornecedor"].astype(str).str.strip().fillna("") == fornecedor
+                ].copy()
+
+                if df_fornecedor.empty:
+                    continue
+
+                if "Profissional" in df_fornecedor.columns:
+                    profissionais_fornecedor.update(
+                        df_fornecedor["Profissional"]
+                        .fillna("Sem profissional")
+                        .astype(str)
+                        .str.strip()
+                        .replace("", "Sem profissional")
+                        .unique()
+                    )
+                else:
+                    profissionais_fornecedor.add("Sem profissional")
+
+            for profissional in sorted(profissionais_fornecedor):
+                doc.add_paragraph(f"Profissional: {profissional}")
+
+                for nome_regra, df_regra in regras_com_resultado.items():
+                    df_fornecedor = df_regra[
+                        df_regra["Fornecedor"].astype(str).str.strip().fillna("") == fornecedor
+                    ].copy()
+
+                    if df_fornecedor.empty:
+                        continue
+
+                    if "Profissional" in df_fornecedor.columns:
+                        df_profissional = df_fornecedor[
+                            df_fornecedor["Profissional"].astype(str).str.strip().fillna("") == profissional
+                        ].copy()
+                    else:
+                        df_profissional = df_fornecedor.copy()
+
+                    if df_profissional.empty:
+                        continue
+
+                    doc.add_paragraph(frase_apontamento(nome_regra))
+                    df_tabela = colunas_word_para_regra(df_profissional, nome_regra)
+                    adicionar_tabela_word(doc, df_tabela)
+                    doc.add_paragraph("")
 
     arquivo = BytesIO()
     doc.save(arquivo)
